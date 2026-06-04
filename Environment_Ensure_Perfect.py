@@ -78,7 +78,7 @@ class Environment():
             score_reward = 0.1
 
             if self.state[0].sum().item() == 0:
-                score_reward += 20.0
+                score_reward += 5.0
             elif len(self.actions) == 0:
                 remaining_blocks = torch.count_nonzero(self.state[0]).item()
                 score_reward -= (remaining_blocks / 10.0)
