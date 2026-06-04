@@ -49,6 +49,7 @@ class AttentionBlock(nn.Module):
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim,
+            dropout=0,
             nhead=num_heads,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
@@ -300,6 +301,9 @@ class PPO_Agent():
     def episode(self):
         self.env.reset()
 
+        self.actor.model.eval()
+        self.critic.model.eval()
+
         state = self.env.state.unsqueeze(0) if self.env.state.dim() == 3 else self.env.state  # 배치 차원 추가
         done = False
         attempt = 0
@@ -395,6 +399,9 @@ class PPO_Agent():
         ax[1][1].plot(self.plot_history['critic_loss'])
         ax[1][1].set_title("Critic Loss")
 
+        if not os.path.exists("./Graph"):
+            os.makedirs("./Graph", exist_ok=True)
+
         plt.savefig(f"./Graph/graph_{self.datetime}.png")
         plt.close()
 
@@ -431,15 +438,19 @@ class PPO_Agent():
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
         old_log_probs = torch.stack(self.batch_history['log_prob']).to(self.device)
+
+        self.actor.model.train()
+        self.critic.model.train()
+        
+        # 반복문 밖에서 누적 변수 초기화
+        actor_loss_sum = 0.0
+        critic_loss_sum = 0.0
+        entropy_sum = 0.0
         
         # PPO 학습을 여러 epoch 동안 반복
         for repeat in range(self.train_repeat):
             # 미니배치로 나누어 학습
             batch_indices = torch.randperm(len(states))
-            
-            actor_loss_sum = 0.0
-            critic_loss_sum = 0.0
-            entropy_sum = 0.0
             
             for i in range(0, len(states), self.mini_batch_size):
                 batch_idx = batch_indices[i:min(i+self.mini_batch_size, len(states))]
@@ -463,9 +474,7 @@ class PPO_Agent():
                 
                 critic_loss_sum += critic_loss.item()
                 
-                # ============= Actor 학습 =============
-                self.actor.model.train()
-                
+                # ============= Actor 학습 =============                
                 # 현재 정책의 log probability 계산
                 action_1 = (batch_actions // 170).long()
                 action_2 = (batch_actions % 170).long()
@@ -509,14 +518,18 @@ class PPO_Agent():
                 actor_loss_sum += actor_loss.item()
                 entropy_sum += entropy.mean().item()
             
-            # 배치별 평균 손실 저장
-            avg_actor_loss = actor_loss_sum / max((len(states) + self.mini_batch_size - 1) // self.mini_batch_size, 1)
-            avg_critic_loss = critic_loss_sum / max((len(states) + self.mini_batch_size - 1) // self.mini_batch_size, 1)
-            
-            self.plot_history['actor_loss'].append(avg_actor_loss)
-            self.plot_history['critic_loss'].append(avg_critic_loss)
-            self.writer.add_scalar("Loss/Actor", avg_actor_loss, self.current_epoch)
-            self.writer.add_scalar("Loss/Critic", avg_critic_loss, self.current_epoch)
+        # 총 실행된 미니배치 수 계산 (1 repeat 당 배치 수 * 총 repeat 수)
+        num_batches_per_repeat = max((len(states) + self.mini_batch_size - 1) // self.mini_batch_size, 1)
+        total_batches = self.train_repeat * num_batches_per_repeat
+
+        # 배치별 평균 손실 저장
+        avg_actor_loss = actor_loss_sum / total_batches
+        avg_critic_loss = critic_loss_sum / total_batches
+        
+        self.plot_history['actor_loss'].append(avg_actor_loss)
+        self.plot_history['critic_loss'].append(avg_critic_loss)
+        self.writer.add_scalar("Loss/Actor", avg_actor_loss, self.current_epoch)
+        self.writer.add_scalar("Loss/Critic", avg_critic_loss, self.current_epoch)
         
         # 배치 히스토리 초기화
         self.batch_history = {
