@@ -59,7 +59,7 @@ class Environment():
         self.score = 0
         state_idx = random.randint(0, len(self.states) - 1) if not self.validation else self.val_idx
         self.state = self.states[state_idx][0].type(torch.float32).unsqueeze(0).clone()
-        self.actions = self.get_actions(self.state)
+        self.actions = self.get_actions(self.state, self.max_size)
 
         if self.validation:
             self.val_idx = (self.val_idx + 1) % len(self.states)
@@ -74,7 +74,7 @@ class Environment():
             self.score += cnt_nonzero
 
             self.state[0][start_row : end_row + 1, start_col : end_col + 1] = 0
-            self.actions = self.get_actions(self.state)
+            self.actions = self.get_actions(self.state, self.max_size)
             score_reward = 0.1
 
             if self.state[0].sum().item() == 0:
@@ -87,20 +87,17 @@ class Environment():
     
         else: return -0.05
     
-    def make_prefix_sum(self, tensor: torch.Tensor):
+    @staticmethod
+    def make_prefix_sum(tensor: torch.Tensor):
         _, H, W = tensor.shape
         ps = torch.zeros((H + 1, W + 1), dtype = torch.int64)
         
-        for i in range(H):
-            row_cum = 0
-            for j in range(W):
-                row_cum += tensor[0][i, j]
-                ps[i + 1, j + 1] = ps[i, j + 1] + row_cum
-        
+        ps[1:, 1:] = torch.cumsum(torch.cumsum(tensor[0].to(torch.int64), dim=0), dim=1)
         return ps
 
-    def get_actions(self, tensor: torch.Tensor):
-        ps = self.make_prefix_sum(tensor)
+    @staticmethod
+    def get_actions(tensor: torch.Tensor, max_size=(1, 10, 17)):
+        ps = Environment.make_prefix_sum(tensor)
         ps_np = ps.cpu().numpy()
         _, h, w = tensor.shape
         rects = find_rects_sum_equals(ps_np, int(h), int(w))
@@ -118,12 +115,13 @@ class Environment():
             max_r = torch.max(indices_rel[0]) + r1
             min_c = torch.min(indices_rel[1]) + c1
             max_c = torch.max(indices_rel[1]) + c1
-            actions.add((int(min_c * self.max_size[1] + min_r), int(max_c * self.max_size[1] + max_r)))
+            actions.add((int(min_c * max_size[1] + min_r), int(max_c * max_size[1] + max_r)))
 
         return sorted(list(actions))
     
-    def get_actions_dict(self):
-        actions = self.actions
+
+    @staticmethod
+    def get_actions_dict(actions: list):
         result = {}
 
         for action in actions:
@@ -134,7 +132,7 @@ class Environment():
         
         return result
 
-    def __init__(self, validation: bool = False, map_dir: str = './Maps'):
+    def __init__(self, validation: bool = False, map_dir: str = './Maps/RL'):
         self.states = []
         self.validation = validation
         self.val_idx = 0
