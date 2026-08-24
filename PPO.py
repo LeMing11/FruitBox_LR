@@ -25,7 +25,7 @@ class PPO_Agent():
         self.env = env
         self.val_env = Environment(validation=True)
 
-        self.actor = Actor(self.device)
+        self.actor = Actor(self.env.max_size, self.device)
         self.critic = Critic(self.device)
 
         self.actor_optim = optim.Adam(self.actor.model.parameters(), lr=lr)
@@ -79,10 +79,10 @@ class PPO_Agent():
             'actor_loss': [], 'critic_loss': [], 'val_scores': []
         }
         self.batch_history = {
-            'state': [], 'action': [], 'can_action': [], 'mask_first': [], 'mask_second': [], 'reward': [], 'value': [], 'done': [], 'log_prob': []
+            'state': [], 'action': [], 'can_action': [], 'mask': [], 'reward': [], 'value': [], 'done': [], 'log_prob': []
         }
 
-    def print_info(self, episode: int, state: torch.Tensor, a1: int, a2: int, reward: float, v_s: torch.Tensor, entropy: torch.Tensor, log_prob: torch.Tensor, attempt: int):
+    def print_info(self, episode: int, state: torch.Tensor, rect_idx: int, reward: float, v_s: torch.Tensor, entropy: torch.Tensor, log_prob: torch.Tensor, attempt: int):
         clear_lines = "\033[A\033[2K" * 20
         if self.first_print:
             self.first_print = False
@@ -91,7 +91,7 @@ class PPO_Agent():
         print(f"Score: {self.env.score} | Attempt: {attempt}")
         print("-" * 30)
         
-        start_row, start_col, end_row, end_col = self.env.get_selected_coord(a1, a2)
+        start_row, start_col, end_row, end_col = self.env.idx_to_rect[rect_idx]
         rect = torch.zeros_like(state.squeeze(0)[0], dtype=torch.bool)
         rect[start_row : end_row + 1, start_col:end_col + 1] = True
 
@@ -135,6 +135,7 @@ class PPO_Agent():
         self.critic.model.eval()
 
         state = self.env.state.unsqueeze(0) if self.env.state.dim() == 3 else self.env.state  # 배치 차원 추가
+        state = state.clone()
         done = False
         attempt = 0
         total_reward = 0.
@@ -144,28 +145,24 @@ class PPO_Agent():
 
             with torch.no_grad():
                 v_s = self.critic.get_value(state, torch.tensor(len(self.env.actions)))
-                action_dict = self.env.get_actions_dict(self.env.actions)
-                a, log_prob, entropy, mask_first, mask_second = self.actor.get_action(state, action_dict)
+                a, log_prob, entropy, mask = self.actor.get_action(state, self.env.actions)    # (action.item(), dist.log_prob(action).item(), dist.entropy().item(), mask)
 
             a = int(a)
-            start_node = a // 170
-            end_node = a % 170
-
             can_action = len(self.env.actions)
-            reward = self.env.step(start_node, end_node)
+            reward = self.env.step(a)
             total_reward += reward
             next_state = self.env.state.unsqueeze(0) if self.env.state.dim() == 3 else self.env.state
+            next_state = next_state.clone()
             
             if attempt % self.print_freq == 0:
-                self.print_info(self.current_episode, state, start_node, end_node, reward, v_s, entropy, log_prob, attempt)
+                self.print_info(self.current_episode, state, a, reward, v_s, entropy, log_prob, attempt)
 
             done = len(self.env.actions) <= 0
 
             self.batch_history['state'].append(state)
-            self.batch_history['action'].append(torch.tensor(start_node * 170 + end_node))
+            self.batch_history['action'].append(torch.tensor(a))
             self.batch_history['can_action'].append(can_action)
-            self.batch_history['mask_first'].append(mask_first.squeeze(0).cpu())
-            self.batch_history['mask_second'].append(mask_second.squeeze(0).cpu())
+            self.batch_history['mask'].append(mask.squeeze(0).cpu())
             self.batch_history['reward'].append(reward)
             self.batch_history['value'].append(v_s.squeeze())
             self.batch_history['done'].append(done)
@@ -175,14 +172,13 @@ class PPO_Agent():
                 states = torch.cat(self.batch_history['state'], dim=0).to(self.device).detach()
                 actions = torch.stack(self.batch_history['action']).to(self.device)
                 can_actions = torch.tensor(self.batch_history['can_action'], dtype=torch.float32).to(self.device)
-                mask_first = torch.stack(self.batch_history['mask_first']).to(self.device)
-                mask_second = torch.stack(self.batch_history['mask_second']).to(self.device)
+                mask = torch.stack(self.batch_history['mask']).to(self.device)
                 rewards = torch.tensor(self.batch_history['reward'], dtype=torch.float32).to(self.device)
                 values = torch.stack(self.batch_history['value']).to(self.device).detach()
                 log_probs = torch.stack(self.batch_history['log_prob']).to(self.device).detach()
                 dones = self.batch_history['done']
 
-                self.train(states, actions, can_actions, mask_first, mask_second, rewards, values, dones, log_probs, next_state)
+                self.train(states, actions, can_actions, mask, rewards, values, dones, log_probs, next_state)
                 avg_score = self.validation()
 
                 self.plot_history['val_scores'].append(avg_score)
@@ -205,7 +201,7 @@ class PPO_Agent():
 
             state = next_state
         
-        self.print_info(self.current_episode, state, start_node, end_node, reward, v_s, entropy, log_prob, attempt)
+        self.print_info(self.current_episode, state, a, reward, v_s, entropy, log_prob, attempt)
         
         self.reward_window.append(total_reward)
         avg_reward = sum(self.reward_window) / len(self.reward_window)
@@ -262,12 +258,12 @@ class PPO_Agent():
         
         return advantages_tensor
 
-    def train(self, states: torch.Tensor, actions: torch.Tensor, can_actions: torch.Tensor, mask_first: torch.Tensor, mask_second: torch.Tensor, rewards: torch.Tensor, values: torch.Tensor, dones: List, log_prob: torch.Tensor, next_state: torch.Tensor):
+    def train(self, states: torch.Tensor, actions: torch.Tensor, can_actions: torch.Tensor, mask: torch.Tensor, rewards: torch.Tensor, values: torch.Tensor, dones: List, log_prob: torch.Tensor, next_state: torch.Tensor):
         advantages = self.get_gae(rewards, values, dones, next_state)
         returns = advantages + values
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        old_log_probs = torch.stack(self.batch_history['log_prob']).to(self.device)
+        old_log_probs = log_prob
 
         self.actor.model.train()
         self.critic.model.train()
@@ -278,7 +274,7 @@ class PPO_Agent():
         entropy_sum = 0.0
         
         # PPO 학습을 여러 epoch 동안 반복
-        for repeat in range(self.train_repeat):
+        for _ in range(self.train_repeat):
             # 미니배치로 나누어 학습
             batch_indices = torch.randperm(len(states))
             
@@ -306,25 +302,12 @@ class PPO_Agent():
                 
                 # ============= Actor 학습 =============                
                 # 현재 정책의 log probability 계산
-                action_1 = (batch_actions // 170).long()
-                action_2 = (batch_actions % 170).long()
-                policy_1, policy_2 = self.actor.evaluate(batch_states, action_1)
-
-                logits_1 = policy_1 + mask_first[batch_idx]
-                logits_2 = policy_2 + mask_second[batch_idx]
-
-                logits_1 = torch.clamp(logits_1, min=-1e9, max=1e9)
-                logits_2 = torch.clamp(logits_2, min=-1e9, max=1e9)
-
-                dist_1 = Categorical(logits=logits_1)
-                dist_2 = Categorical(logits=logits_2)
-
-                curr_log_probs_1 = dist_1.log_prob(action_1)
-                curr_log_probs_2 = dist_2.log_prob(action_2)
-                curr_log_probs = curr_log_probs_1 + curr_log_probs_2
-                
-                # Entropy 계산
-                entropy = dist_1.entropy() + dist_2.entropy()
+                policy = self.actor.evaluate(batch_states)
+                logits = policy + mask[batch_idx]
+                logits = torch.clamp(logits, min=-1e9, max=1e9)
+                dist = Categorical(logits=logits)
+                curr_log_probs = dist.log_prob(batch_actions)
+                entropy = dist.entropy()
                 
                 # PPO Clipped Surrogate Loss
                 ratio = torch.exp(curr_log_probs - batch_old_log_probs)
@@ -335,8 +318,7 @@ class PPO_Agent():
                 progress = (self.current_epoch / self.max_epoch)
                 end = self.end_entropy
                 start = self.start_entropy
-                current_entropy_coef = end + (start - end) * (1 - progress) ** 2
-                
+                current_entropy_coef = end + (start - end) * (1 - progress) ** 2                
                 actor_loss = -torch.min(surr1, surr2).mean() - current_entropy_coef * entropy.mean()
                 
                 # Actor 역전파
@@ -363,7 +345,7 @@ class PPO_Agent():
         
         # 배치 히스토리 초기화
         self.batch_history = {
-            'state': [], 'action': [], 'can_action': [], 'mask_first': [], 'mask_second': [], 'reward': [], 'value': [], 'done': [], 'log_prob': []
+            'state': [], 'action': [], 'can_action': [], 'mask': [], 'reward': [], 'value': [], 'done': [], 'log_prob': []
         }
 
         self.scheduler_actor.step()
@@ -381,14 +363,11 @@ class PPO_Agent():
 
                 while not done:
                     state = self.val_env.state.unsqueeze(0).to(self.device)
-                    action_dict = self.val_env.get_actions_dict(self.val_env.actions)
                     
-                    action, _, _, _, _ = self.actor.get_action(state, action_dict, deterministic=True)
+                    action, _, _, _ = self.actor.get_action(state, self.val_env.actions, deterministic=True)
                     action = int(action)
-                    start_node = action // 170
-                    end_node = action % 170
                     
-                    self.val_env.step(start_node, end_node)
+                    self.val_env.step(action)
                     next_state = self.val_env.state
 
                     done = len(self.val_env.actions) <= 0

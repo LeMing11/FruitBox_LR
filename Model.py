@@ -68,36 +68,54 @@ class MLPHead(nn.Module):
         return self.net(x)      # (B, outdim, ...)
 
 class ActorNet(nn.Module):
-    def __init__(self):
+    def __init__(self, board_size: tuple = (1, 10, 17)):
+        _, h, w = board_size
+        num_actions = (h * (h + 1) // 2) * (w * (w + 1) // 2) - (h * w)
+
         super().__init__()
         self.resnet = ResNet()
-        self.attention = AttentionBlock(embed_dim=128, num_heads=4, num_layers=3)
+        self.attention = AttentionBlock(embed_dim=128, num_heads=4, num_layers=3, seq_len=h * w)
+        self.fc = MLPHead(in_dim=128, hidden_dim=256, out_dim=num_actions)
 
-        self.fc_start = MLPHead(in_dim=128, hidden_dim=128, out_dim=1)
-        self.action_embed = nn.Embedding(num_embeddings=170, embedding_dim=128)
-        self.fc_end = MLPHead(in_dim=256, hidden_dim=256, out_dim=1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.resnet(x)                              # (B, 128, 10, 17)
+        x = self.attention(x)                           # (B, 170, 128)
+        board_embed = x.mean(dim=1)                     # (B, 128)
+        logits = self.fc(board_embed)                   # (B, num_actions)
 
-    def forward_start(self, x: torch.Tensor):
-        x = self.resnet(x)                                      # (B, 128, 10, 17)
-        state_embed = self.attention(x)                         # (B, 170, 128)
-        logits_first = self.fc_start(state_embed).squeeze(-1)   # (B, 170, 1) -> (B, 170)
+        return logits
 
-        return logits_first, state_embed
+class Actor():
+    def __init__(self, board_size: tuple, device: Optional[torch.device] = None):
+        self.device = device or torch.device('cpu')
+        self.model = ActorNet(board_size).to(self.device)
 
-    def forward_end(self, state_embed: torch.Tensor, action_first: torch.Tensor):
-        act_embed: torch.Tensor = self.action_embed(action_first.long())    # (B, 1) -> (B, 128)
+    def get_action(self, state: torch.Tensor, actions: Dict, deterministic: bool = False):
+        state = state.to(self.device) / 10.0
+        logits = self.model(state)
 
-        act_embed_expanded = act_embed.unsqueeze(1).expand(-1, 170, -1)     # (B, 128) -> (B, 1, 128) -> (B, 170, 128)
-        x_combined = torch.cat((state_embed, act_embed_expanded), dim = -1) # (B, 170, 128) + (B, 170, 128) -> (B, 170, 256)
+        mask = torch.full_like(logits, -1e9).to(self.device)
+        valid_actions = torch.as_tensor(actions, dtype=torch.long, device=self.device)
+        mask[:, valid_actions] = 0
+        masked_logits = logits + mask
+        dist = Categorical(logits=masked_logits)
 
-        return self.fc_end(x_combined).squeeze(-1)                          # (B, 170)
-    
+        if deterministic:
+            action = masked_logits.argmax(dim=-1)
+        else:
+            action = dist.sample()
+
+        return (action.item(), dist.log_prob(action), dist.entropy(), mask)
+
+    def evaluate(self, states: torch.Tensor) -> torch.Tensor:
+        states = states.to(self.device) / 10.0
+        return self.model(states)
+
 class CriticNet(nn.Module):
     def __init__(self):
         super().__init__()
         self.resnet = ResNet()
         self.attention = AttentionBlock(embed_dim=128, num_heads=4, num_layers=3)
-
         self.fc_value = MLPHead(in_dim=129, hidden_dim=256, out_dim=1)
     
     def forward(self, x: torch.Tensor, x_num_actions: torch.Tensor):
@@ -108,53 +126,6 @@ class CriticNet(nn.Module):
         x = torch.cat((x, x_num_actions), dim=1)    # (B, 129)
 
         return self.fc_value(x)                     # (B, 1)
-
-class Actor():
-    def __init__(self, device: Optional[torch.device] = None):
-        self.model = ActorNet()
-        self.device = device or torch.device('cpu')
-        self.model.to(self.device)
-
-    def get_action(self, state: torch.Tensor, actions: Dict, deterministic: bool = False):
-        state = state.to(self.device) / 10.0
-        first_actions, state_embed = self.model.forward_start(state)
-        logits_first = first_actions
-        mask_first = torch.full_like(logits_first, -1e9).to(self.device)
-        valid_starts = list(actions.keys())
-        mask_first[0, valid_starts] = 0
-        logits_first = logits_first + mask_first
-        dist_first = Categorical(logits=logits_first)
-
-        if deterministic:
-            action_first = torch.argmax(logits_first, dim=1)
-        else:
-            action_first = dist_first.sample()
-        start_idx = action_first.item()
-
-        valid_ends = actions[start_idx]
-
-        second_actions = self.model.forward_end(state_embed, action_first)
-        logits_second = second_actions.clone()
-        mask_second = torch.full_like(logits_second, -1e9).to(self.device)
-        mask_second[0, valid_ends] = 0
-        logits_second = logits_second + mask_second
-        dist_second = Categorical(logits=logits_second)
-
-        if deterministic:
-            action_second = torch.argmax(logits_second, dim=1)
-        else:
-            action_second = dist_second.sample()
-        
-        total_entropy = dist_first.entropy() + dist_second.entropy()
-        total_log_prob = dist_first.log_prob(action_first) + dist_second.log_prob(action_second)
-
-        return action_first.item() * 170 + action_second.item(), total_log_prob, total_entropy, mask_first, mask_second
-
-    def evaluate(self, states: torch.Tensor, action_first: torch.Tensor):
-        states = states.to(self.device) / 10.0
-        policy_1, state_embed = self.model.forward_start(states)
-        policy_2 = self.model.forward_end(state_embed, action_first)
-        return policy_1, policy_2
 
 class Critic():
     def __init__(self, device: Optional[torch.device] = None):
